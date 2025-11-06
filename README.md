@@ -1,5 +1,5 @@
 # Based_fully
 
-## FULLY BASED REPOSITORY
+Private group exercices given to base/solidity learner.
 
-## OPEN TO README WRITERS
+SC in the repository will be corrections of the exercize
