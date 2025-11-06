@@ -1,0 +1,238 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+/**
+ * @title BatailleNavale
+ * @dev Jeu de bataille navale on-chain pour 2 joueurs
+ * Grille 5x5, chaque joueur place 3 bateaux et tire à tour de rôle
+ */
+contract BatailleNavale {
+    uint256 public constant TAILLE_GRILLE = 5;
+    uint256 public constant NOMBRE_BATEAUX = 3;
+    uint256 public misePartie = 0.01 ether;
+    
+    enum EtatPartie { EnAttente, Placement, EnCours, Terminee }
+    enum ResultatTir { Manque, Touche, Coule }
+    
+    struct Joueur {
+        address adresse;
+        bytes32 grilleCommit; // Hash de la grille pour cacher les bateaux
+        uint8[TAILLE_GRILLE][TAILLE_GRILLE] grilleRevelee;
+        uint8 bateauxRestants;
+        bool aPlace;
+        bool pret;
+    }
+    
+    struct Partie {
+        Joueur joueur1;
+        Joueur joueur2;
+        address tourDe;
+        EtatPartie etat;
+        address gagnant;
+        uint256 cagnotte;
+        uint256 timestamp;
+    }
+    
+    mapping(uint256 => Partie) public parties;
+    mapping(address => uint256) public partieActive;
+    uint256 public prochainIdPartie;
+    
+    event PartieCreee(uint256 indexed idPartie, address indexed createur);
+    event JoueurRejoint(uint256 indexed idPartie, address indexed joueur);
+    event BateauxPlaces(uint256 indexed idPartie, address indexed joueur);
+    event TirEffectue(uint256 indexed idPartie, address indexed tireur, uint8 x, uint8 y, ResultatTir resultat);
+    event PartieTerminee(uint256 indexed idPartie, address indexed gagnant, uint256 gains);
+    
+    /**
+     * @dev Créer une nouvelle partie
+     */
+    function creerPartie() external payable {
+        require(msg.value == misePartie, "Mise incorrecte");
+        require(partieActive[msg.sender] == 0, "Deja dans une partie");
+        
+        uint256 idPartie = ++prochainIdPartie;
+        Partie storage p = parties[idPartie];
+        
+        p.joueur1.adresse = msg.sender;
+        p.joueur1.bateauxRestants = NOMBRE_BATEAUX;
+        p.etat = EtatPartie.EnAttente;
+        p.cagnotte = msg.value;
+        p.timestamp = block.timestamp;
+        
+        partieActive[msg.sender] = idPartie;
+        
+        emit PartieCreee(idPartie, msg.sender);
+    }
+    
+    /**
+     * @dev Rejoindre une partie existante
+     */
+    function rejoindrePartie(uint256 idPartie) external payable {
+        require(msg.value == misePartie, "Mise incorrecte");
+        require(partieActive[msg.sender] == 0, "Deja dans une partie");
+        
+        Partie storage p = parties[idPartie];
+        require(p.etat == EtatPartie.EnAttente, "Partie non disponible");
+        require(p.joueur1.adresse != msg.sender, "Impossible de jouer contre soi-meme");
+        
+        p.joueur2.adresse = msg.sender;
+        p.joueur2.bateauxRestants = NOMBRE_BATEAUX;
+        p.etat = EtatPartie.Placement;
+        p.cagnotte += msg.value;
+        
+        partieActive[msg.sender] = idPartie;
+        
+        emit JoueurRejoint(idPartie, msg.sender);
+    }
+    
+    /**
+     * @dev Placer ses bateaux (commitment scheme pour cacher les positions)
+     * @param commit Hash de la grille: keccak256(abi.encodePacked(grille, salt))
+     */
+    function placerBateaux(uint256 idPartie, bytes32 commit) external {
+        Partie storage p = parties[idPartie];
+        require(p.etat == EtatPartie.Placement, "Phase de placement terminee");
+        
+        Joueur storage j = obtenirJoueur(p, msg.sender);
+        require(!j.aPlace, "Bateaux deja places");
+        
+        j.grilleCommit = commit;
+        j.aPlace = true;
+        
+        // Si les deux joueurs ont placé leurs bateaux, commencer la partie
+        if (p.joueur1.aPlace && p.joueur2.aPlace) {
+            p.etat = EtatPartie.EnCours;
+            // Joueur 1 commence
+            p.tourDe = p.joueur1.adresse;
+        }
+        
+        emit BateauxPlaces(idPartie, msg.sender);
+    }
+    
+    /**
+     * @dev Tirer sur une case de l'adversaire
+     */
+    function tirer(uint256 idPartie, uint8 x, uint8 y) external {
+        require(x < TAILLE_GRILLE && y < TAILLE_GRILLE, "Position invalide");
+        
+        Partie storage p = parties[idPartie];
+        require(p.etat == EtatPartie.EnCours, "Partie non en cours");
+        require(p.tourDe == msg.sender, "Pas votre tour");
+        
+        Joueur storage adversaire = obtenirAdversaire(p, msg.sender);
+        require(adversaire.grilleRevelee[x][y] == 0, "Case deja ciblee");
+        
+        // Marquer la case comme tirée (on ne connaît pas encore le résultat)
+        adversaire.grilleRevelee[x][y] = 1; // 1 = tiré, sera mis à jour lors de la révélation
+        
+        // Passer le tour
+        p.tourDe = adversaire.adresse;
+        
+        emit TirEffectue(idPartie, msg.sender, x, y, ResultatTir.Manque);
+    }
+    
+    /**
+     * @dev Révéler le résultat d'un tir (appelé par le joueur qui a reçu le tir)
+     */
+    function revelerResultat(uint256 idPartie, uint8 x, uint8 y, bool estTouche) external {
+        Partie storage p = parties[idPartie];
+        require(p.etat == EtatPartie.EnCours, "Partie non en cours");
+        
+        Joueur storage j = obtenirJoueur(p, msg.sender);
+        require(j.grilleRevelee[x][y] == 1, "Aucun tir a cette position");
+        
+        ResultatTir resultat = ResultatTir.Manque;
+        
+        if (estTouche) {
+            j.grilleRevelee[x][y] = 2; // 2 = touché
+            resultat = ResultatTir.Touche;
+            
+            // Vérifier si un bateau est coulé (logique simplifiée)
+            j.bateauxRestants--;
+            if (j.bateauxRestants == 0) {
+                resultat = ResultatTir.Coule;
+            }
+        }
+        
+        // Vérifier la victoire
+        if (j.bateauxRestants == 0) {
+            address gagnant = obtenirAdversaire(p, msg.sender).adresse;
+            p.etat = EtatPartie.Terminee;
+            p.gagnant = gagnant;
+            
+            // Payer le gagnant
+            uint256 gains = p.cagnotte;
+            p.cagnotte = 0;
+            payable(gagnant).transfer(gains);
+            
+            // Libérer les joueurs
+            partieActive[p.joueur1.adresse] = 0;
+            partieActive[p.joueur2.adresse] = 0;
+            
+            emit PartieTerminee(idPartie, gagnant, gains);
+        }
+    }
+    
+    /**
+     * @dev Abandonner une partie
+     */
+    function abandonner(uint256 idPartie) external {
+        Partie storage p = parties[idPartie];
+        require(p.etat == EtatPartie.EnCours || p.etat == EtatPartie.Placement, "Impossible d'abandonner");
+        require(msg.sender == p.joueur1.adresse || msg.sender == p.joueur2.adresse, "Pas dans cette partie");
+        
+        address gagnant = msg.sender == p.joueur1.adresse ? p.joueur2.adresse : p.joueur1.adresse;
+        p.etat = EtatPartie.Terminee;
+        p.gagnant = gagnant;
+        
+        uint256 gains = p.cagnotte;
+        p.cagnotte = 0;
+        payable(gagnant).transfer(gains);
+        
+        partieActive[p.joueur1.adresse] = 0;
+        partieActive[p.joueur2.adresse] = 0;
+        
+        emit PartieTerminee(idPartie, gagnant, gains);
+    }
+    
+    /**
+     * @dev Obtenir les informations d'une partie
+     */
+    function obtenirInfoPartie(uint256 idPartie) external view returns (
+        address joueur1,
+        address joueur2,
+        EtatPartie etat,
+        address tourDe,
+        address gagnant,
+        uint256 cagnotte
+    ) {
+        Partie storage p = parties[idPartie];
+        return (
+            p.joueur1.adresse,
+            p.joueur2.adresse,
+            p.etat,
+            p.tourDe,
+            p.gagnant,
+            p.cagnotte
+        );
+    }
+    
+    // Fonctions utilitaires internes
+    function obtenirJoueur(Partie storage p, address adresse) internal view returns (Joueur storage) {
+        if (p.joueur1.adresse == adresse) {
+            return p.joueur1;
+        } else if (p.joueur2.adresse == adresse) {
+            return p.joueur2;
+        }
+        revert("Joueur non trouve");
+    }
+    
+    function obtenirAdversaire(Partie storage p, address adresse) internal view returns (Joueur storage) {
+        if (p.joueur1.adresse == adresse) {
+            return p.joueur2;
+        } else if (p.joueur2.adresse == adresse) {
+            return p.joueur1;
+        }
+        revert("Joueur non trouve");
+    }
+}
